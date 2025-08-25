@@ -3,24 +3,29 @@
 #include <OneWire.h>           // for the Dallas Temperature library to be able to use the temperature sensor
 #include <DallasTemperature.h>
 
+const bool statusAlwaysOn = true; // The led only version of debug mode. Turn off when deployed to save battery flashing LED no one can seee
+const bool debug = true;          // log raw sensor values and output to serial for troubleshooting, setting this to false just logs generic status and errors
+
 // Define sensors to call in code, uncomment the proper ones below for their respective pins
+//! TODO Allow temp to turn off in isolation since its used to correct other items?
 const bool tempSensor = true;         // DS18B20 temp sensor using OneWire library and DallaTemperature, set comms pin below
 const bool conductivitySensor = true; // Gnd to VCC input range form voltage divider to sense continuity, set 3 pins below
 const bool dissolvedO2Sensor = true;  // 0 to 3 V in to ADC, set ADC pin below
 const bool turbiditySensor = true;    //! TODO Leave here?, going to depend on depth rating of sensor, can't find at present
 const bool pressureSensor = true;     // 0.5 to 4.5 V in to ADC, set ADC pin below
 
-// Pin assignment
+// Pin assignments
 const short tempSensorPin = 5;        // Pin for the temperature sensor
-const short conductivityLeadA = 15;   // One lead for conductiviy sensor
+const short conductivityLeadA = 15;   // One lead for conductivity sensor
 const short conductivityLeadB = 17;   // The other lead for conductivity sensor
 const short conductivitySense = 16;   // Pin for the conductivity sensor sense wire
 const short dissolvedO2Pin = 13;      // Pin for analog input from DFrobot dissolved O2 https://wiki.dfrobot.com/Gravity__Analog_Dissolved_Oxygen_Sensor_SKU_SEN0237
 const short batteryVoltageSense = 14; // Pin for the battery value input sensing via ADC
+const short pressureSensor = 19;      // Pin for the pressure sensor input via ADC
 
 // Setup a oneWire instance to communicate with any OneWire devices such as the DS18B20 temp sensor
 OneWire oneWire(tempSensorPin);
-// Pass our oneWire reference to Dallas Temperature sensor for reading
+// Pass our oneWire reference to Dallas Temperature sensor library for reading
 DallasTemperature sensors(&oneWire);
 
 // Variable assignments
@@ -30,7 +35,8 @@ const long ADCRes = 4096;    // Analog in resolution for later reference
 const float VREF = 5000;     // voltage source (in mv) to the devices used to calculate ADC inputs
 
 // Onboard NeoPixel LED colors
-int status = 4; // 0 = Off, 1 = Red, 2 = Green, 3 = Blue, 4 (or anything else) = White
+int status = 4;     // 0 = Off, 1 = Red, 2 = Green, 3 = Blue, 4 (or anything else) = White
+int errorCount = 0; //! TODO increment anytime a log write happens with the status of error for display in webui when accessed.
 
 // Setup for conductivity sensor, static values first
 const int Vin = 3.16;           // input voltage to the voltage divider (measure with a multimeter)
@@ -66,7 +72,7 @@ const short DO_Table[41] = {
 short dissolvedO2Val = 0;
 
 // hold the most recent temp reading
-float currentTemp = 0;
+float currentTemp = 20; // default to 20 C in case no updates are received
 float resistance = 0;
 
 // function declarations
@@ -81,8 +87,11 @@ void setup()
   pinMode(LED_BUILTIN, OUTPUT);
   pinMode(conductivityLeadA, OUTPUT);
   pinMode(conductivityLeadB, OUTPUT);
-  // Start the Serial Monitor for troubleshooting outputs on PC
-  Serial.begin(115200);
+  // Start the Serial Monitor for troubleshooting outputs on PC only if in debug mode
+  if (debug)
+  {
+    Serial.begin(115200);
+  }
   // Start the DS18B20 temp sensor comms
   sensors.begin();
 }
@@ -93,6 +102,7 @@ void loop()
   resistance = checkConductivity(); // check conductivity reading
   currentTemp = getTemperature();   // grab the temp from the meter
   salinity = calcSalinity(resistance, currentTemp);
+  logWrite("info", "TestData"); //! TODO use strcat() to lock data together? Move to functions instead?
   Serial.print("Temp:");
   Serial.print(currentTemp);
   Serial.print(" C, Resistance: ");
@@ -101,13 +111,15 @@ void loop()
   Serial.print(salinity);
   Serial.println(" ppt");
 
-  //! TODO Possibly leave hearbeat in its own function and make the status vs heartbeat mutually exlusive
   LED_Status(status); // Default heartbeat is white flashing LED, change status variable per indicator required
 }
 
 float getTemperature()
 {
-  return sensors.getTempCByIndex(0); // get the reading from the sensor
+  float tempInC = sensors.getTempCByIndex(0); // get the reading from the sensor;
+  //! TODO Figure out what happens if the getTemp command fails to return value and account for it or throw error as required
+  logWrite("info", "TempInC:"); //! TODO figure out how to add data to this string to pass to log as char*
+  return tempInC;
 }
 
 float getDissolvedO2Sat(temp)
@@ -132,7 +144,7 @@ float checkConductivity()
     //! TODO: One lead corrodes way faster because the work is done here, maybe cycle which way the tests are done over time
     delayMicroseconds(dtime);
     raw = analogRead(conductivitySense);
-    if (raw)
+    if (raw != 0 && raw !> 4095)
     {
       buff = raw * Vin;
       Vout = (buff) / ADCRes;  // taking input ADC and converting back to a voltage value
@@ -140,6 +152,11 @@ float checkConductivity()
       R2 = R1 * buff;          // Calc the resistance of the water under test
       R2 = 0.85 * R2 - 14;     //? Optional calibration offset
       total = total + R2;      // add to the existing samples for later averaging
+    }
+    else
+    {
+      // 0 ADC or > 4095 means the value is at an extreme and not likely to be accurate
+      logWrite("error", "ADC value outside of expected range for resistance sensing");
     }
   }
   avg = total / samples; // calc and return the average resistance
@@ -157,6 +174,7 @@ float calcSalinity(float resistance, float temp)
 
 void LED_Status(int x)
 {
+  //! TODO use statusAlwaysOn value in addition to pressure sensing and charge status to determine how to f
   long HeartbeatNewMillis = millis();
   if (HeartbeatNewMillis - HeartbeatOldMillis > x)
   {
@@ -184,6 +202,30 @@ void LED_Status(int x)
     {
       HeartbeatLED = false;
       neopixelWrite(RGB_BUILTIN, 0, 0, 0); // off
+    }
+  }
+}
+
+void logWrite(char type, char message)
+{
+  if (debug)
+  {
+    Serial.print(hour());
+    Serial.print(":");
+    Serial.print(minute());
+    Serial.print(":");
+    Serial.print(second());
+    Serial.print("_");
+    Serial.print(type);
+    Serial.print(": ");
+    Serial.println(message);
+    //! TODO Write to log
+  }
+  else
+  {
+    if (type == "type") //! TODO see if this is how a comparison is done to a char*
+    { 
+      //! TODO write to log
     }
   }
 }
